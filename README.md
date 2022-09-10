@@ -1,5 +1,10 @@
 # ScaleAPI - Image Annotation MVP
 
+## My changes
+So far this is a WIP and no real changes have been made.
+For now I'm planning on changing the backend to Rust+SQLite
+The frontend will be pretty much the same until I change my mind.
+
 ## Setup
 
 I assume you have Ubuntu 14.04
