@@ -13,10 +13,16 @@
 */
 #[allow(non_camel_case_types)]
 use actix_web::{get, post, web, App, HttpResponse, HttpServer};
+use chrono::{self, Local};
+use env_logger::Builder;
+use log::LevelFilter;
 use rand::Rng;
 use rusqlite::{self, Connection};
 use serde_derive::{Deserialize, Serialize};
+use serde_json;
 use serde_rusqlite::*;
+use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,15 +39,17 @@ struct Response {
     top: u32,
     width: u32,
     height: u32,
-    label: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Params {
-    attachment_type: String,
-    attachment: String,
-    objects_to_annotate: Vec<String>,
-    with_labels: bool,
+impl Response {
+    fn empty() -> Self {
+        Self {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -53,8 +61,8 @@ struct Task {
     status: String,
     urgency: Urgency,
     task_type: String,
-    response: Vec<Response>,
-    params: Vec<Params>,
+    response: HashMap<String, Response>,
+    attachment: String,
 }
 impl Task {
     fn new(
@@ -65,8 +73,8 @@ impl Task {
         status: String,
         urgency: Urgency,
         task_type: String,
-        response: Vec<Response>,
-        params: Vec<Params>,
+        response: HashMap<String, Response>,
+        attachment: String,
     ) -> Self {
         Self {
             id,
@@ -77,11 +85,29 @@ impl Task {
             urgency,
             task_type,
             response,
-            params,
+            attachment,
+        }
+    }
+
+    fn to_db_task(self) -> DatabaseTask {
+        DatabaseTask {
+            id: self.id,
+            created_at: self.created_at,
+            completed_at: self.completed_at,
+            instruction: self.instruction,
+            status: self.status,
+            urgency: self.urgency,
+            task_type: self.task_type,
+            response: serde_json::to_string(&self.response).unwrap(),
+            attachment: self.attachment,
         }
     }
 
     fn from_new_task(new_task: NewTask, id: u32) -> Self {
+        let mut response = HashMap::new();
+        new_task.objects.into_iter().for_each(|e| {
+            response.insert(e, Response::empty());
+        });
         Task::new(
             id,
             SystemTime::now()
@@ -93,9 +119,37 @@ impl Task {
             "pending".to_string(),
             new_task.urgency.unwrap_or(Urgency::week),
             "annotation".to_string(),
-            Vec::new(),
-            new_task.params,
+            response,
+            new_task.attachment,
         )
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DatabaseTask {
+    id: u32,
+    created_at: u64,
+    completed_at: u64,
+    instruction: String,
+    status: String,
+    urgency: Urgency,
+    task_type: String,
+    response: String,
+    attachment: String,
+}
+impl DatabaseTask {
+    fn to_task(self) -> Task {
+        Task {
+            id: self.id,
+            created_at: self.created_at,
+            completed_at: self.completed_at,
+            instruction: self.instruction,
+            status: self.status,
+            urgency: self.urgency,
+            task_type: self.task_type,
+            response: serde_json::from_str(&self.response).unwrap(),
+            attachment: self.attachment,
+        }
     }
 }
 
@@ -125,7 +179,7 @@ impl Database {
                 'urgency' TEXT,
                 'task_type' TEXT,
                 'response' BLOB,
-                'params' BLOB,
+                'attachment' TEXT,
             PRIMARY KEY('id'))",
             [],
         )?;
@@ -136,22 +190,23 @@ impl Database {
         let mut q = self
             .connection
             .prepare("SELECT * FROM 'tasks' WHERE id = (?)")?;
-        let mut results = from_rows::<Task>(q.query([id])?);
+        let mut results = from_rows::<DatabaseTask>(q.query([id])?);
         match results.next() {
-            Some(val) => Ok(Some(val.unwrap())),
+            Some(val) => Ok(Some(val.unwrap().to_task())),
             None => Ok(None),
         }
     }
 
-    fn write_task(&self, task: &Task) -> std::result::Result<usize, rusqlite::Error> {
+    fn write_task(&self, task: Task) -> std::result::Result<usize, rusqlite::Error> {
+        let t = task.to_db_task();
         let mut stmt = self
             .connection
             .prepare("INSERT INTO 'tasks' (
-                id, created_at, completed_at, instruction, status, urgency, task_type, response, params
+                id, created_at, completed_at, instruction, status, urgency, task_type, response, attachment
             ) VALUES (
-                :id, :created_at, :completed_at, :instruction, :status, :urgency, :task_type, :response, :params
+                :id, :created_at, :completed_at, :instruction, :status, :urgency, :task_type, :response, :attachment
             )")?;
-        stmt.execute(to_params_named(&task).unwrap().to_slice().as_slice())
+        stmt.execute(to_params_named(&t).unwrap().to_slice().as_slice())
     }
 }
 
@@ -165,7 +220,8 @@ enum Urgency {
 struct NewTask {
     instruction: String,
     urgency: Option<Urgency>,
-    params: Vec<Params>,
+    objects: Vec<String>,
+    attachment: String,
 }
 
 #[post("/annotation")]
@@ -178,12 +234,12 @@ async fn annotation(new_task: web::Json<NewTask>) -> actix_web::Result<HttpRespo
         id = rng.gen::<u32>();
     }
     let task = Task::from_new_task(new_task.into_inner(), id);
-    let num = db.write_task(&task).unwrap();
+    let num = db.write_task(task).unwrap();
     if num == 1 {
-        Ok(HttpResponse::Ok().json(task))
+        Ok(HttpResponse::Ok().json(id))
     } else {
         println!("{}", num);
-        Ok(HttpResponse::InternalServerError().json(task))
+        Ok(HttpResponse::InternalServerError().body("{}"))
     }
 }
 
@@ -201,13 +257,29 @@ async fn task_id(path: web::Path<u32>) -> actix_web::Result<HttpResponse> {
 
 #[actix_web::main]
 async fn start_http_server() -> actix_web::Result<(), std::io::Error> {
-    HttpServer::new(|| App::new().service(annotation).service(task_id))
-        .bind(("0.0.0.0", 8080))?
-        .run()
-        .await
+    HttpServer::new(|| {
+        App::new().service(web::scope("/api/task").service(annotation).service(task_id))
+    })
+    .bind(("0.0.0.0", 8080))?
+    .run()
+    .await
 }
 
 fn main() {
+    // Build the logger
+    Builder::new()
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{}] {} - {}: {}",
+                record.level(),
+                Local::now().format("%d/%m/%y %H:%M:%S"),
+                record.target(),
+                record.args(),
+            )
+        })
+        .filter(None, LevelFilter::Info)
+        .init();
     // Connect to the database
     let database = Database::init(Path::new(SQL_PATH)).unwrap();
     database.create_table().unwrap();
