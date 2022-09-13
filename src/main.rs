@@ -12,6 +12,7 @@
 
 */
 #[allow(non_camel_case_types)]
+use actix_files;
 use actix_web::{get, post, web, App, HttpResponse, HttpServer};
 use chrono::{self, Local};
 use env_logger::Builder;
@@ -31,6 +32,13 @@ const SQL_PATH: &str = "./db.sqlite";
 #[derive(Debug)]
 struct Database {
     connection: Connection,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum TaskStatus {
+    pending,
+    completed,
+    broken,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,7 +66,7 @@ struct Task {
     created_at: u64,
     completed_at: u64,
     instruction: String,
-    status: String,
+    status: TaskStatus,
     urgency: Urgency,
     task_type: String,
     response: HashMap<String, Response>,
@@ -70,7 +78,7 @@ impl Task {
         created_at: u64,
         completed_at: u64,
         instruction: String,
-        status: String,
+        status: TaskStatus,
         urgency: Urgency,
         task_type: String,
         response: HashMap<String, Response>,
@@ -116,7 +124,7 @@ impl Task {
                 .as_secs(),
             0,
             new_task.instruction,
-            "pending".to_string(),
+            TaskStatus::pending,
             new_task.urgency.unwrap_or(Urgency::week),
             "annotation".to_string(),
             response,
@@ -131,7 +139,7 @@ struct DatabaseTask {
     created_at: u64,
     completed_at: u64,
     instruction: String,
-    status: String,
+    status: TaskStatus,
     urgency: Urgency,
     task_type: String,
     response: String,
@@ -197,6 +205,14 @@ impl Database {
         }
     }
 
+    fn get_pending_tasks(&self) -> std::result::Result<Vec<Task>, rusqlite::Error> {
+        let mut q = self
+            .connection
+            .prepare("SELECT * FROM 'tasks' WHERE status = 'pending'")?;
+        let mut results = from_rows::<DatabaseTask>(q.query([])?);
+        Ok(results.map(|t| t.unwrap().to_task()).collect::<Vec<Task>>())
+    }
+
     fn write_task(&self, task: Task) -> std::result::Result<usize, rusqlite::Error> {
         let t = task.to_db_task();
         let mut stmt = self
@@ -243,6 +259,16 @@ async fn annotation(new_task: web::Json<NewTask>) -> actix_web::Result<HttpRespo
     }
 }
 
+#[get("/pending")]
+async fn get_pending(path: web::Path<u32>) -> actix_web::Result<HttpResponse> {
+    let tasks = Database::init(Path::new(SQL_PATH))
+        .unwrap()
+        .get_pending_tasks()
+        .unwrap();
+
+    Ok(HttpResponse::Ok().json(tasks))
+}
+
 #[get("/{task_id}")]
 async fn task_id(path: web::Path<u32>) -> actix_web::Result<HttpResponse> {
     let task_id = path.into_inner();
@@ -258,7 +284,9 @@ async fn task_id(path: web::Path<u32>) -> actix_web::Result<HttpResponse> {
 #[actix_web::main]
 async fn start_http_server() -> actix_web::Result<(), std::io::Error> {
     HttpServer::new(|| {
-        App::new().service(web::scope("/api/task").service(annotation).service(task_id))
+        App::new()
+            .service(actix_files::Files::new("/", "./public"))
+            .service(web::scope("/api/task").service(annotation).service(task_id))
     })
     .bind(("0.0.0.0", 8080))?
     .run()
