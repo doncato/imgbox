@@ -64,7 +64,13 @@ var all_tasks = [];
 var app = angular.module('myApp', []);
 
 app.factory('socket', ['$rootScope', function($rootScope) {
-    var socket = io.connect();
+    var socket = io({
+        upgrade: true,
+        extraHeaders: {
+            "Connection": "Upgrade",
+            "Upgrade": "websocket"
+        }
+    });
 
     return {
         on: function(eventName, callback) {
@@ -137,12 +143,16 @@ app.controller('TaskController', function($scope, socket) {
 /*
 ============ WebSocket Controller ============
 */
-    
+
     // On connection, just output on console
     socket.on('connect', function() {
         $scope.$apply(function() {
             console.log("Connected to WebSocket Server");
         });
+    });
+
+    socket.on("upgrade", () => {
+        const upgradedTransport = socket.io.engine.transport.name; // in most cases, "websocket"
     });
 
     // All messages or errors will be outputed in the message box
@@ -158,7 +168,7 @@ app.controller('TaskController', function($scope, socket) {
         });
     });
 
-    // All tasks get sent to front end, and will load task 
+    // All tasks get sent to front end, and will load task
     // (for scalability, do not send all tasks)
     socket.on('tasks', function(msg) {
         $scope.$apply(function() {
