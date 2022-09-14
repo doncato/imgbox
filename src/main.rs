@@ -12,8 +12,10 @@
 
 */
 #[allow(non_camel_case_types)]
+use actix::{Actor, StreamHandler};
 use actix_files;
-use actix_web::{get, post, web, App, HttpResponse, HttpServer};
+use actix_web::{get, post, web, App, HttpRequest, HttpResponse, HttpServer};
+use actix_web_actors::ws;
 use chrono::{self, Local};
 use env_logger::Builder;
 use log::LevelFilter;
@@ -209,7 +211,7 @@ impl Database {
         let mut q = self
             .connection
             .prepare("SELECT * FROM 'tasks' WHERE status = 'pending'")?;
-        let mut results = from_rows::<DatabaseTask>(q.query([])?);
+        let results = from_rows::<DatabaseTask>(q.query([])?);
         Ok(results.map(|t| t.unwrap().to_task()).collect::<Vec<Task>>())
     }
 
@@ -260,7 +262,7 @@ async fn annotation(new_task: web::Json<NewTask>) -> actix_web::Result<HttpRespo
 }
 
 #[get("/pending")]
-async fn get_pending(path: web::Path<u32>) -> actix_web::Result<HttpResponse> {
+async fn get_pending() -> actix_web::Result<HttpResponse> {
     let tasks = Database::init(Path::new(SQL_PATH))
         .unwrap()
         .get_pending_tasks()
@@ -281,12 +283,49 @@ async fn task_id(path: web::Path<u32>) -> actix_web::Result<HttpResponse> {
     Ok(HttpResponse::Ok().json(task))
 }
 
+struct Ws;
+
+impl Actor for Ws {
+    type Context = ws::WebsocketContext<Self>;
+}
+
+impl StreamHandler<std::result::Result<ws::Message, ws::ProtocolError>> for Ws {
+    fn handle(
+        &mut self,
+        msg: std::result::Result<ws::Message, ws::ProtocolError>,
+        ctx: &mut Self::Context,
+    ) {
+        match msg {
+            Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
+            Ok(ws::Message::Text(text)) => ctx.text(text),
+            Ok(ws::Message::Binary(bin)) => ctx.binary(bin),
+            _ => (),
+        }
+    }
+}
+
+#[get("/")]
+async fn socket_index(
+    req: HttpRequest,
+    stream: web::Payload,
+) -> std::result::Result<HttpResponse, actix_web::Error> {
+    let resp = ws::start(Ws {}, &req, stream);
+    println!("{:?}", resp);
+    resp
+}
+
 #[actix_web::main]
 async fn start_http_server() -> actix_web::Result<(), std::io::Error> {
     HttpServer::new(|| {
         App::new()
+            .service(
+                web::scope("/api/task")
+                    .service(annotation)
+                    .service(get_pending)
+                    .service(task_id),
+            )
+            .service(web::scope("/socket.io").service(socket_index))
             .service(actix_files::Files::new("/", "./public"))
-            .service(web::scope("/api/task").service(annotation).service(task_id))
     })
     .bind(("0.0.0.0", 8080))?
     .run()
@@ -306,7 +345,7 @@ fn main() {
                 record.args(),
             )
         })
-        .filter(None, LevelFilter::Info)
+        .filter(None, LevelFilter::Debug)
         .init();
     // Connect to the database
     let database = Database::init(Path::new(SQL_PATH)).unwrap();
